@@ -38,9 +38,10 @@ void *thread_tree = NULL;
 
 #define ID_TRACE_CORRUPTED 0x100
 
-static void set_time_stamp(uint32_t timestamp)
-{
-}
+#define INFO(text, ...) printf("\x1b[36m" text "\x1b[0m", ##__VA_ARGS__)
+
+void set_time(uint32_t t);
+void set_isr(uint32_t x);
 
 void signal_corrupted()
 {
@@ -79,19 +80,20 @@ struct thread_info* get_thread(uint32_t id)
 		r->id = id;
 		p = tsearch(r, &thread_tree, thread_tree_id_compare);
 		r = *(struct thread_info**)p;
-		printf("%d\n", r);
 	}
 	return *(struct thread_info**)p;
 }
 
 void ev_system_reset(uint32_t time_stamp)
 {
+	INFO("--- SYSTEM RESET ---\n");
 }
 
 void ev_thread_create(uint32_t thread_id, uint32_t time_stamp)
 {
-	set_time_stamp(time_stamp);
+	set_time(time_stamp);
 	SEGGER_SYSVIEW_OnTaskCreate(thread_id);
+	INFO("Thread 0x%08X: Created\n", thread_id);
 }
 
 
@@ -114,6 +116,7 @@ struct thread_info* ev_thread_info_data(uint32_t thread_id, uint8_t* data, bool 
 	} else {
 		signal_corrupted();
 	}
+	INFO("Thread 0x%08X: info chunk, total %d\n", thread_id, info->buffer_size);
 	return info;
 }
 
@@ -131,6 +134,13 @@ void ev_thread_info_end(uint32_t thread_id, uint8_t* data)
 	info->priority = info->buffer[7];
 	info->name = (char *)&info->buffer[8];
 	send_tharead_info(info);
+	INFO("Thread 0x%08X: prio=%d, stack=%d@0x%08X, name='%s'\n", thread_id, info->priority, info->stack_size, info->stack_base, info->name);
+}
+
+void buffer_overflow(uint32_t count, uint32_t time_stamp)
+{
+	set_time(time_stamp);
+	SEGGER_SYSVIEW_RecordU32(SYSVIEW_EVTID_OVERFLOW, count);
 }
 
 static void parse_event(uint32_t first, uint32_t param)
@@ -184,7 +194,77 @@ static void parse_event(uint32_t first, uint32_t param)
 		ev_thread_info_end(param, (uint8_t*)&additional);
 		break;
 	
+	case EV_SYNCH_START:
+		INFO("Sync\n");
+		break;
+
+	case EV_THREAD_READY:
+		set_time(time_stamp);
+		SEGGER_SYSVIEW_OnTaskStartReady(param);
+		INFO("Thread 0x%08X: Ready\n", param);
+		break;
+
+	case EV_THREAD_START:
+		set_time(time_stamp);
+		SEGGER_SYSVIEW_OnTaskStartExec(param);
+		INFO("Thread 0x%08X: Exec\n", param);
+		break;
+	
+	case EV_THREAD_STOP:
+		set_time(time_stamp);
+		SEGGER_SYSVIEW_OnTaskStopExec();
+		INFO("Thread [current]: Stop\n");
+		break;
+	
+	case EV_SYS_CALL:
+		set_time(time_stamp);
+		SEGGER_SYSVIEW_RecordVoid(param);
+		INFO("Call 0x%08X\n", param);
+		break;
+	
+	case EV_SYS_END_CALL:
+		set_time(time_stamp);
+		SEGGER_SYSVIEW_RecordEndCall(param);
+		INFO("Exit 0x%08X\n", param);
+		break;
+	
+	case EV_ISR_ENTER:
+		set_time(time_stamp);
+		set_isr(isr);
+		SEGGER_SYSVIEW_RecordEnterISR();
+		INFO("ISR %d: Enter\n", isr);
+		break;
+	
+	case EV_ISR_EXIT:
+		set_time(time_stamp);
+		SEGGER_SYSVIEW_RecordExitISR();
+		INFO("ISR [current]: Exit\n");
+		break;
+
+	case EV_THREAD_PEND:
+		set_time(time_stamp);
+		SEGGER_SYSVIEW_OnTaskStopReady(param, 0);
+		INFO("Thread 0x%08X: Pending\n", param);
+		break;
+
+	case EV_IDLE:
+		set_time(time_stamp);
+		SEGGER_SYSVIEW_OnIdle();
+		INFO("Idle\n");
+		break;
+
+	case EV_BUFFER_OVERFLOW:
+		INFO("\x1b[31m" "--- BUFFER OVERFLOW ---\n");
+		INFO("Lost %d events\n", param);
+		buffer_overflow(param, time_stamp);
+		break;
+
+	case EV_BUFFER_CYCLE:
+		INFO("Cycle with counter %d\n", param);
+		break;
 	default:
+		printf("0x%08X\n\n", event);
+		exit(1);
 		break;
 	}
 }
@@ -220,7 +300,7 @@ void parseEvents()
 	}
 }
 
-void test()
+void test1()
 {
 	static struct _mock_timer t;
 	static struct k_thread idle;
@@ -240,6 +320,49 @@ void test()
 	parseEvents();
 }
 
+
+void test()
+{
+        FILE* out = fopen("out.SVDat", "a");
+	SEGGER_RTT_Init();
+    	SEGGER_SYSVIEW_Conf();
+	FILE* f = fopen("/home/doki/test.log", "r");
+	bool start = true;
+	uint8_t buf[65536];
+	while (!feof(f))
+	{
+		int n = fread(buf, 1, sizeof(buf), f);
+		if (n == 0) break;
+		if (n < 0) exit(12);
+		uint8_t* ptr = buf;
+		if (start)
+		{
+			int i;
+			for (i = 0; i < n - 4; i++)
+			{
+				if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] != '#')
+				{
+					ptr = &buf[i + 2];
+					break;
+				}
+			}
+			start = false;
+		}
+		uint32_t tab[2];
+		while (n >= 8)
+		{
+			memcpy(tab, ptr, 8);
+			n -= 8;
+			ptr += 8;
+			parse_event(tab[0], tab[1]);
+			static uint8_t buffer[65536];
+			uint32_t NumBytes = SEGGER_RTT_ReadUpBufferNoLock(SEGGER_SYSVIEW_GetChannelID(), buffer, sizeof(buffer));
+			fwrite(buffer, 1, NumBytes, out);
+		}
+	}
+	fclose(f);
+	fclose(out);
+}
 
 
 #if DO_TESTING

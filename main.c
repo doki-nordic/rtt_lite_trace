@@ -214,6 +214,23 @@ void SEGGER_SYSVIEW_Conf(void)
 
 FILE* out = NULL;
 
+void set_time(uint32_t t)
+{
+    global_time_stamp = t;
+    if (no_time_stamp)
+    {
+        uint32_t diff = global_time_stamp - time_offset;
+        time_offset = time_offset - diff + 1;
+        global_time_stamp = time_offset + diff;
+        no_time_stamp = false;
+    }
+}
+
+void set_isr(uint32_t x)
+{
+	isr_number = x;
+}
+
 void parse_event(uint8_t* data)
 {
     EventInfo_t info;

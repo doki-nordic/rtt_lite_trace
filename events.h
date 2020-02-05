@@ -241,8 +241,8 @@
 #define EV_PRINT 0x1F000000
 
 // TODO: Synchronization pattern events
-#define EV_SYNCH_START 0x78
-#define EV_SYNCH_END 0x7F
+#define EV_SYNCH_START 0x78000000
+#define EV_SYNCH_END 0x7F000000
 
 
 /*
