@@ -1,0 +1,270 @@
+/*
+ * Copyright (c) 2019 Nordic Semiconductor
+ *
+ * SPDX-License-Identifier: LicenseRef-BSD-5-Clause-Nordic
+ */
+
+#include <sys/select.h>
+#include <sys/time.h>
+#include <time.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <errno.h>
+#include <nrfjprog.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <getopt.h>
+#include <ctype.h>
+#include <arpa/inet.h>
+#include <dlfcn.h>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/ip.h> 
+
+
+#include "options.h"
+#include "logs.h"
+#include "rtt.h"
+
+#include "SEGGER_RTT.h"
+#include "SEGGER_SYSVIEW.h"
+
+
+static volatile bool exit_loop = false;
+
+void my_handler(int s)
+{
+    PRINT_DEBUG("Caught signal %d in %d (parent %d)",s, getpid(), getppid());
+    if (exit_loop)
+    {
+        PRINT_ERROR("Forcing process to terminate.");
+        exit(TERMINATION_EXIT_CODE);
+    }
+    exit_loop = true;
+}
+
+bool is_hang()
+{
+    if (options.hang_file && access(options.hang_file, 0 ) >= 0)
+    {
+        PRINT_INFO("Link is hang");
+        return true;
+    }
+    return false;
+}
+
+
+static void sendSystemDesc(void)
+{
+    SEGGER_SYSVIEW_SendSysDesc("N=Test App,D=Cortex-M4");
+    SEGGER_SYSVIEW_SendSysDesc("I#15=SysTick");
+}
+
+int channelID;
+
+void SEGGER_SYSVIEW_Conf(void)
+{
+    static SEGGER_SYSVIEW_OS_API api = {
+        .pfGetTime = NULL,
+        .pfSendTaskList = NULL,
+    };
+    SEGGER_SYSVIEW_Init(1000000, 64000000, &api, sendSystemDesc);
+    SEGGER_SYSVIEW_SetRAMBase(0);
+    channelID = SEGGER_SYSVIEW_GetChannelID();
+    SEGGER_SYSVIEW_Start();
+}
+
+int main(int argc, char* argv[])
+{
+    parse_args(argc, argv);
+    //tap_create();
+
+    SEGGER_SYSVIEW_Conf();
+
+    signal(SIGINT, my_handler);
+
+    if (!options.no_rtt_retry)
+    {
+        do
+        {
+            while (is_hang() && !exit_loop)
+            {
+                usleep(1000 * 1000);
+            }
+
+            if (exit_loop)
+            {
+                //tap_delete();
+                PRINT_INFO("TERMINATED parent process");
+                exit(TERMINATION_EXIT_CODE);
+            }
+
+            int pid = fork();
+
+            if (pid < 0)
+            {
+                U_ERRNO_FATAL("Cannot fork process!");
+            }
+            else if (pid == 0)
+            {
+                if (is_hang())
+                {
+                    exit(RECOVERABLE_EXIT_CODE);
+                }
+                break;
+            }
+            else
+            {
+                int wstatus = 0;
+                PRINT_INFO("Child process %d", pid);
+                pid_t r = waitpid(pid, &wstatus, 0);
+                //tap_set_state(false);
+                PRINT_INFO("PID %d, %d, %d", r, WEXITSTATUS(wstatus), wstatus);
+                if (WIFSIGNALED(wstatus) && !exit_loop)
+                {
+                    PRINT_ERROR("Unexpected child %d exit, signal %d", pid, WTERMSIG(wstatus));
+                    usleep(1000 * 1000);
+                }
+                else if (WEXITSTATUS(wstatus) == TERMINATION_EXIT_CODE && r >= 0)
+                {
+                    exit_loop = true;
+                }
+                else if (WEXITSTATUS(wstatus) != RECOVERABLE_EXIT_CODE && r >= 0)
+                {
+                    exit(wstatus);
+                }
+                else if (!exit_loop)
+                {
+                    usleep(1000 * 1000);
+                }
+            }
+        }
+        while (true);
+    }
+
+    //nrfjprog_init(true);
+
+    //tap_set_state(true);
+
+    PRINT_INFO("BEGIN");
+
+    int last_hang_check;
+    if (options.hang_file)
+    {
+        last_hang_check = time(NULL);
+    }
+
+    uint8_t buffer[1024];
+
+    //SEGGER_SYSVIEW_OnTaskCreate(0x10);
+    //SEGGER_SYSVIEW_OnTaskCreate(0x20);
+
+    SEGGER_SYSVIEW_OnTaskStopExec();
+    SEGGER_SYSVIEW_OnIdle();
+    //SEGGER_SYSVIEW_OnTaskStartReady(0x10);
+    //SEGGER_SYSVIEW_OnTaskStartExec(0x10);
+    //SEGGER_SYSVIEW_OnTaskStartReady(0x20);
+    //SEGGER_SYSVIEW_OnTaskStopExec();
+    //SEGGER_SYSVIEW_OnTaskStartExec(0x20);
+    //SEGGER_SYSVIEW_OnTaskStopExec();
+    //SEGGER_SYSVIEW_OnIdle();
+    //SEGGER_SYSVIEW_OnTaskStopExec();
+    //SEGGER_SYSVIEW_OnTaskStartExec(0x20);
+    //SEGGER_SYSVIEW_OnTaskStopReady(0x20, 0);
+    //SEGGER_SYSVIEW_OnTaskStopExec();
+    //SEGGER_SYSVIEW_OnIdle();
+
+
+    int server_fd, new_socket, valread; 
+    struct sockaddr_in address; 
+    int opt = 1; 
+    int addrlen = sizeof(address); 
+
+    // Creating socket file descriptor 
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) 
+    { 
+        perror("socket failed"); 
+        exit(EXIT_FAILURE); 
+    } 
+       
+    // Forcefully attaching socket to the port 19111 
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) 
+    { 
+        perror("setsockopt"); 
+        exit(EXIT_FAILURE); 
+    } 
+    address.sin_family = AF_INET; 
+    address.sin_addr.s_addr = INADDR_ANY; 
+    address.sin_port = htons( 19111 ); 
+       
+    // Forcefully attaching socket to the port 19111 
+    if (bind(server_fd, (struct sockaddr *)&address,  sizeof(address))<0) 
+    { 
+        perror("bind failed"); 
+        exit(EXIT_FAILURE); 
+    } 
+    if (listen(server_fd, 3) < 0) 
+    { 
+        perror("listen"); 
+        exit(EXIT_FAILURE); 
+    } 
+    while (!exit_loop)
+    {
+        /*if ((new_socket = accept(server_fd, (struct sockaddr *)&address,  
+                           (socklen_t*)&addrlen))<0) 
+        { 
+            perror("accept"); 
+            exit(EXIT_FAILURE); 
+        } 
+        printf("a=%d\n", new_socket);*/
+
+        uint32_t NumBytes = SEGGER_RTT_ReadUpBufferNoLock(channelID, buffer, sizeof(buffer));
+
+        printf("s=%d\n", NumBytes);
+
+        FILE* f = fopen("out.SVDat", "w");
+        fwrite(buffer, 1, NumBytes, f);
+        fclose(f);
+        exit(0);
+
+
+        int s = send(new_socket, buffer, NumBytes, 0);
+
+        printf("s=%d\n", s);
+
+        sleep(1);
+    }
+
+    PRINT_INFO("TERMINATED");
+
+    //NRFJPROG_close_dll();
+
+
+    if (options.no_rtt_retry)
+    {
+        //tap_delete();
+    }
+
+    return TERMINATION_EXIT_CODE;
+}
+
+U32 SEGGER_SYSVIEW_X_GetTimestamp()
+{
+    static uint32_t t = 0;
+    t++;
+    return t;
+}
+
+
+U32 SEGGER_SYSVIEW_X_GetInterruptId(void)
+{
+    return 0;
+}
+

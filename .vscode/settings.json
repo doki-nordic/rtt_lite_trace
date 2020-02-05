@@ -1,0 +1,13 @@
+{
+    "files.associations": {
+	"options.h": "c",
+	"dyn_nrfjprogdll.h": "c",
+	"inet.h": "c",
+	"ctype.h": "c",
+	"stdbool.h": "c",
+	"rtt_lite_trace.h": "c",
+	"segger_sysview.h": "c",
+	"segger_sysview_int.h": "c",
+	"stdlib.h": "c"
+}
+}
