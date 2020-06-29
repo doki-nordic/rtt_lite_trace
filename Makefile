@@ -41,8 +41,9 @@ all: SysViewLight
 clean:
 	rm -f SysViewLight
 
-SysViewLight: Makefile version.make ../SysView/*.c ../SysView/*.h ./SEGGER/SEGGER_RTT.c ./SEGGER/SEGGER_SYSVIEW.c
-	gcc $(CFLAGS) -o $@ -I$(NRFJPROG_REAL_PATH) $(filter %.c,$^) -ldl
+#SysViewLight: Makefile version.make ../SysView/*.c ../SysView/*.h ./SEGGER/SEGGER_RTT.c ./SEGGER/SEGGER_SYSVIEW.c
+SysViewLight: Makefile version.make ../SysView/main.cpp
+	g++ $(CFLAGS) -o $@ -I$(NRFJPROG_REAL_PATH) $(filter %.cpp,$^) $(filter %.c,$^) -ldl
 	$(STRIP) $@
 
 version.make: get_version.sh $(wildcard .git/HEAD) $(wildcard .git/refs/tags/*)

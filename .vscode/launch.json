@@ -9,7 +9,6 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/SysViewLight",
-            "args": ["--nrfjproglib", "/dk/apps/nrf-tools/nrfjprog/libnrfjprogdll.so", "--norttretry"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
@@ -21,7 +20,8 @@
                     "text": "-enable-pretty-printing",
                     "ignoreFailures": true
                 }
-            ]
+	    ],
+	    "preLaunchTask": "build",
         }
     ]
 }
