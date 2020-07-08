@@ -18,7 +18,7 @@
  *         bits. Else it contains minimum free space of RTT buffer if
  *         CONFIG_RTT_LITE_TRACE_BUFFER_STATS is set.
  */
-#define EV_BUFFER_CYCLE 0x01000000
+#define EV_CYCLE 0x01000000
 
 /** @brief Event reporting change of thread priority.
  *
@@ -81,6 +81,7 @@
  *
  * @param additional Unused.
  * @param param      Format id.
+ * @param buffer     Format string and arguments list.
  */
 #define EV_FORMAT 0x06000000
 
@@ -129,6 +130,7 @@
  * 
  * @param additional  Unused.
  * @param param       Resource id which is usually pointer to it.
+ * @param buffer      String containing the name, not NULL-terminated.
  */
 #define EV_RES_NAME 0x0B000000
 
@@ -151,11 +153,11 @@
  * 
  * @param param      Number of events that were skipped because of overflow.
  */
-#define EV_BUFFER_OVERFLOW 0x12000000
+#define EV_OVERFLOW 0x12000000
 
 /** @brief Event send when systems goes into idle.
  * 
- * @param param       The same as EV_BUFFER_CYCLE.
+ * @param param       The same as EV_CYCLE.
  */
 #define EV_IDLE 0x13000000
 
@@ -232,6 +234,7 @@
  * @param param       Bits 0:23 - Id of previously send format or
  *         0xFFFFFF if format will be contained in the following buffer.
  *         Bits 24:31 - Level of the message, see RTT_LITE_TRACE_LEVEL_xyz.
+ * @param buffer      String containing the name, not NULL-terminated.
  */
 #define EV_PRINTF 0x1E000000
 
@@ -293,3 +296,5 @@
 #define _RTT_LITE_TRACE_EV_USER_LAST 0x77000000
 
 #define EV_INTERNAL_CORRUPTED 0x79000000
+#define EV_INTERNAL_OVERFLOW 0x7A000000
+#define EV_INTERNAL_THREAD_INFO EV_THREAD_INFO_END

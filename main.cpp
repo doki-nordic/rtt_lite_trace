@@ -28,6 +28,11 @@
 #include <netinet/in.h>
 #include <netinet/ip.h> 
 
+#include <string>
+#include <functional>
+#include <vector>
+#include <deque>
+#include <map>
 
 #include "options.h"
 #include "logs.h"
@@ -65,9 +70,6 @@ int parse_header(const char *str, int len)
 }
 
 
-#include <string>
-#include <functional>
-#include <vector>
 
 class LogReader
 {
@@ -75,6 +77,13 @@ public:
 	LogReader(const std::string& file_name);
 	~LogReader();
 	bool readEvent(uint32_t &event, uint32_t &param);
+	std::vector<std::string>& getHeaders() {
+		return headers;
+	}
+	uint64_t getFileSize() {
+		return data_end - data_start;
+	}
+
 private:
 	FILE* f;
 	std::vector<std::string> headers;
@@ -86,7 +95,7 @@ private:
 	void readFooter();
 	static int parseHeader(const char *str);
 	static int parseFooter(const char *str, size_t len);
-	void synchronize();
+	int synchronize();
 	int read(void* buffer, int length);
 	int seek(int offset);
 };
@@ -235,6 +244,17 @@ int LogReader::parseHeader(const char *str)
 	return str - start;
 }
 
+
+std::vector<std::string> stringCache = { "" };
+
+uint32_t generateCorrupted(uint32_t &param, const auto& callback) {
+	param = stringCache.size();
+	std::string str(1024, '\0');
+	str.resize(callback((char*)str.c_str()));
+	stringCache.push_back(std::move(str));
+	return EV_INTERNAL_CORRUPTED;
+}
+
 bool LogReader::readEvent(uint32_t &event, uint32_t &param)
 {
 	int len;
@@ -262,7 +282,7 @@ bool LogReader::readEvent(uint32_t &event, uint32_t &param)
 				break;
 			}
 			// no break - fall into valid event
-		case EV_BUFFER_CYCLE:
+		case EV_CYCLE:
 		case EV_THREAD_PRIORITY:
 		case EV_THREAD_INFO_BEGIN:
 		case EV_THREAD_INFO_NEXT:
@@ -274,7 +294,7 @@ bool LogReader::readEvent(uint32_t &event, uint32_t &param)
 		case EV_BUFFER_BEGIN_END:
 		case EV_RES_NAME:
 		case EV_SYSTEM_RESET:
-		case EV_BUFFER_OVERFLOW:
+		case EV_OVERFLOW:
 		case EV_IDLE:
 		case EV_THREAD_START:
 		case EV_THREAD_STOP:
@@ -302,17 +322,18 @@ bool LogReader::readEvent(uint32_t &event, uint32_t &param)
 			break; // invalid sync - synchronize the stream
 		}
 
-		synchronize();
+		len = synchronize();
 
-		event = EV_INTERNAL_CORRUPTED;
-		param = 0;
+		event = generateCorrupted(param, [len](auto x) {
+			return sprintf(x, "Corrupted data. Synchronized after %d bytes.", len);
+		});
 		return true;
 		
 	} while (true);
 }
 
 
-void LogReader::synchronize()
+int LogReader::synchronize()
 {
 	uint8_t buffer[1024];
 	int res;
@@ -336,7 +357,7 @@ void LogReader::synchronize()
 		len += res;
 
 		if (len < 8) {
-			return;
+			return total + len;
 		}
 
 		for (int i = 0; i <= len - 8; i++) {
@@ -346,7 +367,7 @@ void LogReader::synchronize()
 					FATAL("Input file read error %d!", res);
 				}
 				fprintf(stderr, "Stream synchronized after %d bytes\n", total + i);
-				return;
+				return total + i;
 			}
 		}
 
@@ -358,23 +379,433 @@ void LogReader::synchronize()
 	} while (true);
 }
 
+class OverflowDetection
+{
+public:
+	OverflowDetection(const std::string& file_name);
+	bool readEvent(uint32_t &event, uint32_t &param);
+	std::vector<std::string>& getHeaders() {
+		return reader.getHeaders();
+	}
+private:
+	struct Event {
+		uint32_t event;
+		uint32_t param;
+		Event(uint32_t e, uint32_t p) : event(e), param(p) { }
+	};
+
+	LogReader reader;
+	std::deque<Event> queue;
+	uint32_t queueMaxSize;
+
+	uint32_t counter;
+	size_t lastCounterUpdate;
+	bool counterValid;
+
+	void fillQueue();
+	void checkCounter(uint32_t currentCounter, uint32_t inc);
+};
+
+OverflowDetection::OverflowDetection(const std::string& file_name) : reader(file_name)
+{
+	if (reader.getFileSize() >= 4 * 1024 * 1024) {
+		queueMaxSize = 1024 * 1024;
+	} else {
+		queueMaxSize = reader.getFileSize() / 4;
+	}
+	counterValid = false;
+}
+
+bool OverflowDetection::readEvent(uint32_t &event, uint32_t &param)
+{
+	fillQueue();
+
+	if (queue.size() == 0)
+		return false;
+
+	event = queue.front().event;
+	param = queue.front().param;
+	queue.pop_front();
+	if (counterValid) {
+		if (lastCounterUpdate == 0) {
+			counterValid = false;
+		} else {
+			lastCounterUpdate--;
+		}
+	}
+
+	return true;
+}
+
+void OverflowDetection::fillQueue()
+{
+	uint32_t event;
+	uint32_t param;
+	uint32_t id;
+
+	while (queue.size() < queueMaxSize && reader.readEvent(event, param)) {
+
+		id = event & 0xFF000000;
+		if (id & 0x80000000) {
+			id = 0x80000000;
+		}
+
+		switch (id)
+		{
+		case EV_CYCLE:
+			if (param & 1) {
+				checkCounter(param, 2);
+			}
+			break;
+
+		case EV_IDLE:
+			if (param & 1) {
+				checkCounter(param, 0);
+			}
+			break;
+		
+		case EV_SYSTEM_RESET:
+			counter = 1;
+			counterValid = true;
+			checkCounter(1, 0);
+			break;
+		
+		default:
+			break;
+		}
+		queue.push_back(Event(event, param));
+	}
+}
+
+void OverflowDetection::checkCounter(uint32_t currentCounter, uint32_t inc)
+{
+	uint32_t expected = counter + inc;
+	int32_t diff = currentCounter - expected;
+	
+	if (!counterValid) {
+		if (currentCounter > 1) {
+			fprintf(stderr, "Overflow detected before reset. Dropping %d events.\n", (int)queue.size());
+			queue.clear();
+			queue.push_back(Event(EV_SYSTEM_RESET, 0));
+			queue.push_back(Event(EV_OVERFLOW, 0));
+		}
+	} else if (diff > 0) {
+		fprintf(stderr, "Overflow detected. Dropping %d events.\n", (int)(queue.size() - lastCounterUpdate));
+		queue.erase(queue.begin() + lastCounterUpdate + 1, queue.end());
+		queue.push_back(Event(EV_INTERNAL_OVERFLOW, 0));
+	} else if (diff < 0) {
+		fprintf(stderr, "Overflow detected and reset in it. Dropping %d events.\n", (int)(queue.size() - lastCounterUpdate));
+		queue.erase(queue.begin() + lastCounterUpdate + 1, queue.end());
+		queue.push_back(Event(EV_SYSTEM_RESET, 0));
+		queue.push_back(Event(EV_OVERFLOW, 0));
+	}
+
+	counter = currentCounter;
+	counterValid = true;
+	lastCounterUpdate = queue.size();
+}
+
+class TimeStampCalc
+{
+public:
+	TimeStampCalc(const std::string &file_name) : reader(file_name), currentTime(0), resetTime(0) {}
+	bool readEvent(uint64_t &time, uint32_t &event, uint32_t &param);
+	std::vector<std::string>& getHeaders() {
+		return reader.getHeaders();
+	}
+private:
+	OverflowDetection reader;
+	uint64_t currentTime;
+	uint64_t resetTime;
+};
+
+bool TimeStampCalc::readEvent(uint64_t &time, uint32_t &event, uint32_t &param)
+{
+	uint32_t id;
+	bool hasTimeStamp;
+	
+	if (!reader.readEvent(event, param))
+		return false;
+
+	id = event & 0xFF000000;
+
+	if (id == EV_SYSTEM_RESET) {
+		resetTime = resetTime + currentTime + 1;
+		currentTime = 0;
+		hasTimeStamp = true;
+	} else if (id <= 0x0F000000uL) {
+		hasTimeStamp = false;
+	} else if (id <= 0x77000000uL) {
+		hasTimeStamp = true;
+	} else if (id <= 0x7F000000uL) {
+		hasTimeStamp = false;
+	} else {
+		hasTimeStamp = true;
+	}
+
+	if (hasTimeStamp) {
+		uint32_t old = currentTime & 0x00FFFFFF;
+		uint32_t now = event & 0x00FFFFFF;
+		if (now < old) {
+			currentTime += (uint64_t)0x01000000;
+		}
+		currentTime &= ~(uint64_t)0x00FFFFFF;
+		currentTime |= (uint64_t)now;
+	}
+
+	time = resetTime + currentTime;
+
+	return true;
+}
+
+class BufferCombine
+{
+public:
+	BufferCombine(const std::string &file_name) : reader(file_name), currentThread((uint64_t)2 << 32), currentContext((uint64_t)2 << 32) {}
+	bool readEvent(uint64_t &time, uint32_t &event, uint32_t &param, std::basic_string<uint8_t> &buffer);
+	std::vector<std::string>& getHeaders() {
+		return reader.getHeaders();
+	}
+private:
+	enum BufferState {
+		BUFFER_EMPTY,
+		BUFFER_RUNNING,
+		BUFFER_DONE,
+	};
+	struct Event {
+		uint64_t time;
+		uint32_t event;
+		uint32_t param;
+		Event(uint64_t t, uint32_t e, uint32_t p) : time(t), event(e), param(p) { }
+	};
+	struct Context {
+		std::basic_string<uint8_t> buffer;
+		BufferState bufferState;
+		std::basic_string<uint8_t> threadInfo;
+		BufferState threadInfoState;
+		Context() : bufferState(BUFFER_EMPTY), threadInfoState(BUFFER_EMPTY) {};
+	};
+	TimeStampCalc reader;
+	std::map<uint64_t, Context> ctx;
+	uint64_t currentThread;
+	uint64_t currentContext;
+	std::vector<uint64_t> isrStack;
+};
+
+bool BufferCombine::readEvent(uint64_t &time, uint32_t &event, uint32_t &param, std::basic_string<uint8_t> &buffer)
+{
+	uint32_t id;
+	bool bufferExpected;
+
+	do {
+		if (!reader.readEvent(time, event, param))
+			return false;
+
+		id = event & 0xFF000000;
+		if (id & 0x80000000) {
+			id = 0x80000000;
+		}
+
+		if (id == EV_FORMAT || id == EV_PRINTF || id == EV_PRINT  || id == EV_RES_NAME) {
+
+			auto& c = ctx[param];
+			if (c.threadInfoState != BUFFER_DONE) {
+				// TODO: Report error
+			}
+			std::swap(c.buffer, buffer);
+			c.buffer.clear();
+			return true;
+
+		} else if (id >= _RTT_LITE_TRACE_EV_USER_FIRST && id <= _RTT_LITE_TRACE_EV_USER_LAST) {
+
+			auto& c = ctx[param];
+			if (c.threadInfoState == BUFFER_RUNNING) {
+				// TODO: Report error
+				event = EV_INTERNAL_CORRUPTED;
+				return true;
+			}
+			std::swap(c.buffer, buffer);
+			c.buffer.clear();
+			return true;
+
+		} else if (id == EV_THREAD_START) {
+
+			currentThread = (uint64_t)param;
+			isrStack.clear();
+			currentContext = currentThread;
+			return true;
+
+		} else if (id == EV_SYSTEM_RESET || id == EV_OVERFLOW || id == EV_INTERNAL_OVERFLOW || id == EV_INTERNAL_CORRUPTED) {
+
+			ctx.clear();
+			isrStack.clear();
+			currentThread = (uint64_t)2 << 32;
+			currentContext = (uint64_t)2 << 32;
+			return true;
+
+		} else if (id == EV_ISR_ENTER) {
+
+			currentContext = ((uint64_t)1 << 32) | (event & 0x7F000000) | isrStack.size();
+			isrStack.push_back(currentContext);
+			return true;
+
+		} else if (id == EV_ISR_EXIT) {
+
+			if (isrStack.size() > 0) {
+				isrStack.pop_back();
+			}
+			if (isrStack.size() > 0) {
+				currentContext = isrStack.back();
+			} else {
+				currentContext = currentThread;
+			}
+			return true;
+
+		} else if (id == EV_THREAD_INFO_BEGIN) {
+
+			auto& c = ctx[param];
+			if (c.threadInfoState != BUFFER_EMPTY) {
+				// TODO: Report warning
+			}
+			c.threadInfo.clear();
+			c.threadInfo.append((uint8_t*)&event, 3);
+			c.threadInfoState = BUFFER_RUNNING;
+
+		} else if (id == EV_THREAD_INFO_NEXT) {
+
+			auto& c = ctx[param];
+			if (c.threadInfoState != BUFFER_RUNNING) {
+				// TODO: Report error
+				event = EV_INTERNAL_CORRUPTED;
+				return true;
+			}
+			c.threadInfo.append((uint8_t*)&event, 3);
+
+		} else if (id == EV_THREAD_INFO_END) {
+
+			auto& c = ctx[param];
+			if (c.threadInfoState != BUFFER_RUNNING) {
+				// TODO: Report error
+				event = EV_INTERNAL_CORRUPTED;
+				return true;
+			}
+			c.threadInfo.append((uint8_t*)&event, 3);
+			std::swap(c.threadInfo, buffer);
+			c.threadInfo.clear();
+			c.threadInfoState = BUFFER_EMPTY;
+			return true;
+
+		} else if (id == EV_BUFFER_BEGIN) {
+
+			auto& c = ctx[currentContext];
+			if (c.bufferState != BUFFER_EMPTY) {
+				// TODO: Report warning
+			}
+			c.buffer.clear();
+			c.buffer.append((uint8_t*)&param, 4);
+			c.buffer.append((uint8_t*)&event, 3);
+			c.bufferState = BUFFER_RUNNING;
+
+		} else if (id == EV_BUFFER_NEXT) {
+
+			auto& c = ctx[currentContext];
+			if (c.bufferState != BUFFER_RUNNING) {
+				// TODO: Report error
+				event = EV_INTERNAL_CORRUPTED;
+				return true;
+			}
+			c.buffer.append((uint8_t*)&param, 4);
+			c.buffer.append((uint8_t*)&event, 3);
+
+		} else if (id == EV_BUFFER_END) {
+
+			auto& c = ctx[currentContext];
+			if (c.bufferState != BUFFER_RUNNING) {
+				// TODO: Report error
+				event = EV_INTERNAL_CORRUPTED;
+				return true;
+			}
+			c.buffer.append((uint8_t*)&param, 4);
+			c.buffer.append((uint8_t*)&event, 2);
+			size_t lastChunk = (event >> 16) & 0xFF;
+			if (lastChunk < 6) {
+				c.buffer.resize(c.buffer.length() - 6 + lastChunk);
+			}
+			c.bufferState = BUFFER_DONE;
+
+		} else if (id == EV_BUFFER_BEGIN_END) {
+
+			auto& c = ctx[currentContext];
+			if (c.bufferState != BUFFER_EMPTY) {
+				// TODO: Report warning
+			}
+			c.buffer.clear();
+			c.buffer.append((uint8_t*)&param, 4);
+			c.buffer.append((uint8_t*)&event, 2);
+			size_t lastChunk = (event >> 16) & 0xFF;
+			if (lastChunk < 6) {
+				c.buffer.resize(c.buffer.length() - 6 + lastChunk);
+			}
+			c.bufferState = BUFFER_DONE;
+
+		} else {
+
+			return true;
+
+		}
+
+	} while (true);
+}
+
 int main()
 {
-
-	LogReader reader("./test.log");
+	BufferCombine reader("./test.log");
+	std::basic_string<uint8_t> buf;
 
 	uint32_t event;
 	uint32_t param;
+	uint64_t time;
 	int i = 0;
 
-	while (reader.readEvent(event, param)) {
-		printf("0x%08X  0x%08X\n", event, param);
+	while (reader.readEvent(time, event, param, buf)) {
+		if ((event & 0xFF000000) == EV_OVERFLOW) {
+			printf("Overflow %d\n", param);
+		} else if (buf.size() > 0) {
+			printf("%10d  0x%08X  0x%08X   ", (int)time, event, param);
+			for (int k = 0; k < buf.size(); k++) {
+				printf(" %02X", buf[k]);
+			}
+			printf("   \"");
+			for (int k = 0; k < buf.size(); k++) {
+				printf("%c", buf[k] >= ' ' && buf[k] < '\x7F' ? buf[k] : '?');
+			}
+			printf("\"\n");
+			buf.clear();
+		} else {
+			//printf("%10d  0x%08X  0x%08X\n", (int)time, event, param);
+		}
 		i++;
-		if (i == 20) break;
+		//if (i == 20) break;
 	}
 
 	return 0;
 }
+
+extern "C"
+U32 SEGGER_SYSVIEW_X_GetTimestamp()
+{
+    static uint32_t t = 0;
+    t++;
+    return t;
+}
+
+
+extern "C"
+U32 SEGGER_SYSVIEW_X_GetInterruptId(void)
+{
+    return 0;
+}
+
 
 
 
@@ -404,20 +835,20 @@ struct Session *sessions;
 size_t sessions_size;
 size_t sessions_len;
 
-void parse_bufer_cycle(uint64_t time, uint32_t param)
+void parse_cycle(uint64_t time, uint32_t param)
 {
 	if (param & 1) {
 		uint32_t counter = param >> 1;
 		if (state.buffer_counter == VAL_UNKNOWN) {
-			add_event(state.time, EV_BUFFER_OVERFLOW, 0, OVERFLOW_UNKNOWN);
+			add_event(state.time, EV_OVERFLOW, 0, OVERFLOW_UNKNOWN);
 			events_len = state.last_cycle;
 		} else if (counter < state.buffer_counter + 1) {
-			add_event(state.time, EV_BUFFER_OVERFLOW, 0, OVERFLOW_UNKNOWN);
+			add_event(state.time, EV_OVERFLOW, 0, OVERFLOW_UNKNOWN);
 			events_len = state.last_cycle;
 			do_reset();
-			add_event(state.time, EV_BUFFER_OVERFLOW, 0, OVERFLOW_UNKNOWN);
+			add_event(state.time, EV_OVERFLOW, 0, OVERFLOW_UNKNOWN);
 		} else if (counter > state.buffer_counter + 1) {
-			add_event(state.time, EV_BUFFER_OVERFLOW, 0, OVERFLOW_UNKNOWN);
+			add_event(state.time, EV_OVERFLOW, 0, OVERFLOW_UNKNOWN);
 			events_len = state.last_cycle;
 		}
 		state.buffer_counter = counter;
@@ -457,8 +888,8 @@ void read_commands(FILE* f)
 
 		switch (cmd) {
 		
-		case EV_BUFFER_CYCLE:
-			parse_bufer_cycle(param);
+		case EV_CYCLE:
+			parse_cycle(param);
 			break;
 
 		case EV_THREAD_PRIORITY:
@@ -472,7 +903,7 @@ void read_commands(FILE* f)
 		case EV_BUFFER_BEGIN_END:
 		case EV_RES_NAME:
 		case EV_SYSTEM_RESET:
-		case EV_BUFFER_OVERFLOW:
+		case EV_OVERFLOW:
 		case EV_IDLE:
 		case EV_THREAD_START:
 		case EV_THREAD_STOP:
